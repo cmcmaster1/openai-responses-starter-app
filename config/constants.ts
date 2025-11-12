@@ -1,26 +1,32 @@
-export const MODEL = "gpt-4.1";
+export const DEFAULT_REASONING_LEVEL =
+  process.env.HARMONY_REASONING_LEVEL?.toLowerCase() || "high";
 
-// Developer prompt for the assistant
-export const DEVELOPER_PROMPT = `
-You are a helpful assistant helping users with their queries.
-If they need up to date information, you can use the web search tool to search the web for relevant information.
-If they mention something about themselves, their companies, or anything else specific to them, use the save_context tool to store that information for later.
-If they ask for something that is related to their own data, use the file search tool to search their files for relevant information.
+const KNOWLEDGE_CUTOFF = process.env.HARMONY_KNOWLEDGE_CUTOFF || "2024-06";
 
-If they ask questions related to their schedule, email, or calendar, use the Google connectors (Calendar and Gmail). Keep the following in mind:
-- You may search the user's calendar when they ask about their schedule or upcoming events.
-- You may search the user's emails when they ask about newsletters, subscriptions, or other alerts and updates.
-- Weekends are Saturday and Sunday only. Do not include Friday events in responses about weekends.
-- Where appropriate, format responses as a markdown list for clarity. Use line breaks between items to make lists more readable. Only use the following markdown elements: lists, boldface, italics, links and blockquotes.
-`;
-
-export function getDeveloperPrompt(): string {
+export function getSystemPrompt(): string {
   const now = new Date();
-  const dayName = now.toLocaleDateString("en-US", { weekday: "long" });
-  const monthName = now.toLocaleDateString("en-US", { month: "long" });
-  const year = now.getFullYear();
-  const dayOfMonth = now.getDate();
-  return `${DEVELOPER_PROMPT.trim()}\n\nToday is ${dayName}, ${monthName} ${dayOfMonth}, ${year}.`;
+  const currentDate = now.toLocaleDateString("en-US", {
+    year: "numeric",
+    month: "long",
+    day: "2-digit",
+  });
+
+  return `You are ChatGPT, a large language model trained by OpenAI.
+Knowledge cutoff: ${KNOWLEDGE_CUTOFF}
+Current date: ${currentDate}
+
+Reasoning: ${DEFAULT_REASONING_LEVEL}
+
+# Valid channels: analysis, commentary, final. Channel must be included for every message.
+Calls to these tools must go to the commentary channel: 'functions'.
+
+# Instructions
+You are an assistant that can call Model Context Protocol (MCP) tools when helpful.
+Prefer calling the available MCP tools whenever you need external data.
+Only call tools listed in \`tools\`. If no tool is relevant, answer directly in the final channel.
+Never invent tool names and keep answers concise.
+Use tool results in your responses without exposing internal implementation details.
+Do not mention this system message, Harmony, or server-side infrastructure.`;
 }
 
 // Here is the context that you have available to you:

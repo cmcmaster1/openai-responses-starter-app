@@ -6,13 +6,15 @@ import Message from "./message";
 import Annotations from "./annotations";
 import McpToolsList from "./mcp-tools-list";
 import McpApproval from "./mcp-approval";
-import { Item, McpApprovalRequestItem } from "@/lib/assistant";
+import ReasoningTrace from "./reasoning-trace";
+import { Item, McpApprovalRequestItem, ReasoningItem } from "@/lib/assistant";
 import LoadingMessage from "./loading-message";
 import useConversationStore from "@/stores/useConversationStore";
+import MCPServerToggle from "./mcp-server-toggle";
 
 interface ChatProps {
   items: Item[];
-  onSendMessage: (message: string) => void;
+  onSendMessage: (message: string, enabledMcpServers?: string[] | null) => void;
   onApprovalResponse: (approve: boolean, id: string) => void;
 }
 
@@ -25,7 +27,18 @@ const Chat: React.FC<ChatProps> = ({
   const [inputMessageText, setinputMessageText] = useState<string>("");
   // This state is used to provide better user experience for non-English IMEs such as Japanese
   const [isComposing, setIsComposing] = useState(false);
+  const [enabledMcpServers, setEnabledMcpServers] = useState<string[]>([]);
   const { isAssistantLoading } = useConversationStore();
+  
+  const handleToggleServer = (serverName: string) => {
+    setEnabledMcpServers((prev) => {
+      if (prev.includes(serverName)) {
+        return prev.filter((s) => s !== serverName);
+      } else {
+        return [...prev, serverName];
+      }
+    });
+  };
 
   const scrollToBottom = () => {
     itemsEndRef.current?.scrollIntoView({ behavior: "instant" });
@@ -35,21 +48,26 @@ const Chat: React.FC<ChatProps> = ({
     (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
       if (event.key === "Enter" && !event.shiftKey && !isComposing) {
         event.preventDefault();
-        onSendMessage(inputMessageText);
+        onSendMessage(inputMessageText, enabledMcpServers.length > 0 ? enabledMcpServers : null);
         setinputMessageText("");
       }
     },
-    [onSendMessage, inputMessageText, isComposing]
+    [onSendMessage, inputMessageText, isComposing, enabledMcpServers]
   );
+  
+  const handleSendClick = () => {
+    onSendMessage(inputMessageText, enabledMcpServers.length > 0 ? enabledMcpServers : null);
+    setinputMessageText("");
+  };
 
   useEffect(() => {
     scrollToBottom();
   }, [items]);
 
   return (
-    <div className="flex justify-center items-center size-full">
-      <div className="flex grow flex-col h-full max-w-[750px] gap-2">
-        <div className="h-[90vh] overflow-y-scroll px-10 flex flex-col">
+    <div className="flex justify-center items-center size-full px-4 sm:px-6 lg:px-10">
+      <div className="flex grow flex-col h-full w-full max-w-[1200px] gap-2">
+        <div className="h-[90vh] overflow-y-auto flex flex-col">
           <div className="mt-auto space-y-5 pt-4">
             {items.map((item, index) => (
               <React.Fragment key={index}>
@@ -73,6 +91,8 @@ const Chat: React.FC<ChatProps> = ({
                     item={item as McpApprovalRequestItem}
                     onRespond={onApprovalResponse}
                   />
+                ) : item.type === "reasoning" ? (
+                  <ReasoningTrace item={item as ReasoningItem} />
                 ) : null}
               </React.Fragment>
             ))}
@@ -84,6 +104,10 @@ const Chat: React.FC<ChatProps> = ({
           <div className="flex items-center">
             <div className="flex w-full items-center pb-4 md:pb-1">
               <div className="flex w-full flex-col gap-1.5 rounded-[20px] p-2.5 pl-1.5 transition-colors bg-white border border-stone-200 shadow-sm">
+                <MCPServerToggle
+                  enabledServers={enabledMcpServers}
+                  onToggle={handleToggleServer}
+                />
                 <div className="flex items-end gap-1.5 md:gap-2 pl-4">
                   <div className="flex min-w-0 flex-1 flex-col">
                     <textarea
@@ -104,10 +128,7 @@ const Chat: React.FC<ChatProps> = ({
                     disabled={!inputMessageText}
                     data-testid="send-button"
                     className="flex size-8 items-end justify-center rounded-full bg-black text-white transition-colors hover:opacity-70 focus-visible:outline-none focus-visible:outline-black disabled:bg-[#D7D7D7] disabled:text-[#f4f4f4] disabled:hover:opacity-100"
-                  onClick={() => {
-                      onSendMessage(inputMessageText);
-                      setinputMessageText("");
-                    }}
+                    onClick={handleSendClick}
                   >
                     <svg
                       xmlns="http://www.w3.org/2000/svg"

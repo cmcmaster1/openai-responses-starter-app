@@ -40,3 +40,9 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# MCP venv
+.venv-mcp/
+RESPONSES_JS_SETUP.md
+RESPONSES_JS_STATUS.md
+AGENTS.md

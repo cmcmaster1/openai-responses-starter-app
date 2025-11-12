@@ -1,50 +1,42 @@
 "use client";
 import Assistant from "@/components/assistant";
-import ToolsPanel from "@/components/tools-panel";
+import SessionSidebar from "@/components/session-sidebar";
 import { Menu, X } from "lucide-react";
-import { useEffect, useState } from "react";
-import { useRouter } from "next/navigation";
-import useConversationStore from "@/stores/useConversationStore";
+import { useState } from "react";
 
 export default function Main() {
-  const [isToolsPanelOpen, setIsToolsPanelOpen] = useState(false);
-  const router = useRouter();
-  const { resetConversation } = useConversationStore();
-
-  // After OAuth redirect, reinitialize the conversation so the next turn
-  // uses the connector-enabled server configuration immediately
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    const isConnected = new URLSearchParams(window.location.search).get("connected");
-    if (isConnected === "1") {
-      resetConversation();
-      router.replace("/", { scroll: false });
-    }
-  }, [router, resetConversation]);
+  const [isSidebarOpen, setIsSidebarOpen] = useState(false);
 
   return (
-    <div className="flex justify-center h-screen">
-      <div className="w-full md:w-[70%]">
+    <div className="flex h-screen bg-white">
+      <div className="hidden md:flex md:w-80 lg:w-[22rem]">
+        <SessionSidebar />
+      </div>
+      <div className="flex-1">
         <Assistant />
       </div>
-      <div className=" hidden md:block w-[30%]">
-        <ToolsPanel />
-      </div>
-      {/* Hamburger menu for small screens */}
-      <div className="absolute top-4 right-4 md:hidden">
-        <button onClick={() => setIsToolsPanelOpen(true)}>
+      <div className="absolute top-4 left-4 md:hidden z-20">
+        <button
+          onClick={() => setIsSidebarOpen(true)}
+          className="rounded-full border border-zinc-200 bg-white p-2 shadow-sm"
+          aria-label="Open sessions sidebar"
+        >
           <Menu size={24} />
         </button>
       </div>
-      {/* Overlay panel for ToolsPanel on small screens */}
-      {isToolsPanelOpen && (
-        <div className="fixed inset-0 z-50 flex justify-end bg-black bg-opacity-30">
-          <div className="w-full bg-white h-full p-4">
-            <button className="mb-4" onClick={() => setIsToolsPanelOpen(false)}>
-              <X size={24} />
-            </button>
-            <ToolsPanel />
+      {isSidebarOpen && (
+        <div className="fixed inset-0 z-50 flex">
+          <div className="w-11/12 max-w-sm">
+            <SessionSidebar />
           </div>
+          <div className="flex-1 bg-black/40" onClick={() => setIsSidebarOpen(false)} />
+          <button
+            className="absolute top-4 right-4 text-white"
+            onClick={() => setIsSidebarOpen(false)}
+            aria-label="Close sidebar"
+          >
+            <X size={24} />
+          </button>
         </div>
       )}
     </div>
