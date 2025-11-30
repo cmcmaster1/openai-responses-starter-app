@@ -1,14 +1,10 @@
 "use client";
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger, DialogFooter } from "./ui/dialog";
 import { Input } from "./ui/input";
 import { Button } from "./ui/button";
 import { Plus, X, Trash2, AlertCircle } from "lucide-react";
-
-interface MCPServer {
-  name: string;
-  tools: Array<{ name: string; description?: string }>;
-}
+import useMCPServersStore from "@/stores/useMCPServersStore";
 
 interface AddServerForm {
   name: string;
@@ -19,10 +15,12 @@ interface AddServerForm {
 }
 
 export default function MCPServersManager() {
-  const [servers, setServers] = useState<MCPServer[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const { servers, loading, error, loadedAt, setServers, setLoading, setError } =
+    useMCPServersStore();
   const [isAddDialogOpen, setIsAddDialogOpen] = useState(false);
+  const [hydrated, setHydrated] = useState(
+    () => useMCPServersStore.persist?.hasHydrated?.() ?? false
+  );
   const [formData, setFormData] = useState<AddServerForm>({
     name: "",
     transport: "http",
@@ -31,24 +29,45 @@ export default function MCPServersManager() {
     args: [],
   });
 
-  const loadServers = async () => {
-    try {
-      setLoading(true);
-      const response = await fetch("/api/mcp/servers");
-      if (!response.ok) throw new Error("Failed to load servers");
-      const data = await response.json();
-      setServers(data.servers || []);
-      setError(null);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to load servers");
-    } finally {
-      setLoading(false);
-    }
-  };
+  useEffect(() => {
+    const unsubscribeFinish = useMCPServersStore.persist?.onFinishHydration?.(() => {
+      setHydrated(true);
+    });
+    const unsubscribeHydrate = useMCPServersStore.persist?.onHydrate?.(() => {
+      setHydrated(false);
+    });
+    setHydrated(useMCPServersStore.persist?.hasHydrated?.() ?? false);
+    return () => {
+      unsubscribeFinish?.();
+      unsubscribeHydrate?.();
+    };
+  }, []);
+
+  const loadServers = useCallback(
+    async (force = false) => {
+      if (!hydrated) return;
+      if (!force && loadedAt) return;
+      try {
+        setLoading(true);
+        setError(null);
+        const response = await fetch("/api/mcp/servers");
+        if (!response.ok) throw new Error("Failed to load servers");
+        const data = await response.json();
+        setServers(data.servers || []);
+        setError(null);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "Failed to load servers");
+      } finally {
+        setLoading(false);
+      }
+    },
+    [hydrated, loadedAt, setError, setLoading, setServers]
+  );
 
   useEffect(() => {
-    loadServers();
-  }, []);
+    if (!hydrated) return;
+    void loadServers();
+  }, [hydrated, loadServers]);
 
   const handleAddServer = async () => {
     if (!formData.name.trim()) {
@@ -98,7 +117,7 @@ export default function MCPServersManager() {
       // Reset form and reload servers
       setFormData({ name: "", transport: "http", url: "", command: "", args: [] });
       setIsAddDialogOpen(false);
-      await loadServers();
+      await loadServers(true);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to add server");
     } finally {
@@ -122,7 +141,7 @@ export default function MCPServersManager() {
         throw new Error(data.error || "Failed to disconnect server");
       }
 
-      await loadServers();
+      await loadServers(true);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to remove server");
     } finally {
@@ -152,116 +171,127 @@ export default function MCPServersManager() {
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <div className="text-zinc-600 text-sm font-medium">MCP Servers</div>
-        <Dialog open={isAddDialogOpen} onOpenChange={setIsAddDialogOpen}>
-          <DialogTrigger asChild>
-            <Button
-              size="sm"
-              variant="outline"
-              className="h-7 px-2 text-xs"
-              onClick={() => {
-                setFormData({ name: "", transport: "http", url: "", command: "", args: [] });
-                setError(null);
-              }}
-            >
-              <Plus className="h-3 w-3 mr-1" />
-              Add Server
-            </Button>
-          </DialogTrigger>
-          <DialogContent className="max-w-md">
-            <DialogHeader>
-              <DialogTitle>Add MCP Server</DialogTitle>
-            </DialogHeader>
-            <div className="space-y-4 py-4">
-              <div className="space-y-2">
-                <label className="text-sm font-medium">Server Name</label>
-                <Input
-                  placeholder="my-server"
-                  value={formData.name}
-                  onChange={(e) => setFormData({ ...formData, name: e.target.value })}
-                />
-              </div>
-              <div className="space-y-2">
-                <label className="text-sm font-medium">Transport</label>
-                <select
-                  className="w-full border rounded px-3 py-2 text-sm"
-                  value={formData.transport}
-                  onChange={(e) =>
-                    setFormData({
-                      ...formData,
-                      transport: e.target.value as "http" | "stdio",
-                    })
-                  }
-                >
-                  <option value="http">HTTP</option>
-                  <option value="stdio">stdio (requires MCP_ENABLE_STDIO=true)</option>
-                </select>
-              </div>
-              {formData.transport === "http" ? (
+        <div className="flex items-center gap-2">
+          <Button
+            size="sm"
+            variant="ghost"
+            className="h-7 px-2 text-xs"
+            onClick={() => loadServers(true)}
+            disabled={!hydrated || loading}
+          >
+            Refresh
+          </Button>
+          <Dialog open={isAddDialogOpen} onOpenChange={setIsAddDialogOpen}>
+            <DialogTrigger asChild>
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-7 px-2 text-xs"
+                onClick={() => {
+                  setFormData({ name: "", transport: "http", url: "", command: "", args: [] });
+                  setError(null);
+                }}
+              >
+                <Plus className="h-3 w-3 mr-1" />
+                Add Server
+              </Button>
+            </DialogTrigger>
+            <DialogContent className="max-w-md">
+              <DialogHeader>
+                <DialogTitle>Add MCP Server</DialogTitle>
+              </DialogHeader>
+              <div className="space-y-4 py-4">
                 <div className="space-y-2">
-                  <label className="text-sm font-medium">URL</label>
+                  <label className="text-sm font-medium">Server Name</label>
                   <Input
-                    placeholder="https://example.com/mcp"
-                    value={formData.url || ""}
-                    onChange={(e) => setFormData({ ...formData, url: e.target.value })}
+                    placeholder="my-server"
+                    value={formData.name}
+                    onChange={(e) => setFormData({ ...formData, name: e.target.value })}
                   />
                 </div>
-              ) : (
                 <div className="space-y-2">
-                  <label className="text-sm font-medium">Command</label>
-                  <Input
-                    placeholder="npx"
-                    value={formData.command || ""}
-                    onChange={(e) => setFormData({ ...formData, command: e.target.value })}
-                  />
-                  <label className="text-sm font-medium">Arguments (one per line)</label>
-                  <div className="space-y-1">
-                    {(formData.args || []).map((arg, idx) => (
-                      <div key={idx} className="flex gap-1">
-                        <Input
-                          placeholder={`arg-${idx + 1}`}
-                          value={arg}
-                          onChange={(e) => updateArg(idx, e.target.value)}
-                        />
-                        <Button
-                          type="button"
-                          size="sm"
-                          variant="ghost"
-                          onClick={() => removeArg(idx)}
-                        >
-                          <X className="h-4 w-4" />
-                        </Button>
-                      </div>
-                    ))}
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant="outline"
-                      onClick={addArg}
-                      className="w-full"
-                    >
-                      <Plus className="h-3 w-3 mr-1" />
-                      Add Argument
-                    </Button>
+                  <label className="text-sm font-medium">Transport</label>
+                  <select
+                    className="w-full border rounded px-3 py-2 text-sm"
+                    value={formData.transport}
+                    onChange={(e) =>
+                      setFormData({
+                        ...formData,
+                        transport: e.target.value as "http" | "stdio",
+                      })
+                    }
+                  >
+                    <option value="http">HTTP</option>
+                    <option value="stdio">stdio (requires MCP_ENABLE_STDIO=true)</option>
+                  </select>
+                </div>
+                {formData.transport === "http" ? (
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium">URL</label>
+                    <Input
+                      placeholder="https://example.com/mcp"
+                      value={formData.url || ""}
+                      onChange={(e) => setFormData({ ...formData, url: e.target.value })}
+                    />
                   </div>
-                </div>
-              )}
-              {error && (
-                <div className="flex items-center gap-2 text-sm text-red-600">
-                  <AlertCircle className="h-4 w-4" />
-                  {error}
-                </div>
-              )}
-            </div>
-            <DialogFooter>
-              <Button variant="outline" onClick={() => setIsAddDialogOpen(false)}>
-                Cancel
-              </Button>
-              <Button onClick={handleAddServer} disabled={loading}>
-                {loading ? "Connecting..." : "Connect"}
-              </Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
+                ) : (
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium">Command</label>
+                    <Input
+                      placeholder="npx"
+                      value={formData.command || ""}
+                      onChange={(e) => setFormData({ ...formData, command: e.target.value })}
+                    />
+                    <label className="text-sm font-medium">Arguments (one per line)</label>
+                    <div className="space-y-1">
+                      {(formData.args || []).map((arg, idx) => (
+                        <div key={idx} className="flex gap-1">
+                          <Input
+                            placeholder={`arg-${idx + 1}`}
+                            value={arg}
+                            onChange={(e) => updateArg(idx, e.target.value)}
+                          />
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="ghost"
+                            onClick={() => removeArg(idx)}
+                          >
+                            <X className="h-4 w-4" />
+                          </Button>
+                        </div>
+                      ))}
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        onClick={addArg}
+                        className="w-full"
+                      >
+                        <Plus className="h-3 w-3 mr-1" />
+                        Add Argument
+                      </Button>
+                    </div>
+                  </div>
+                )}
+                {error && (
+                  <div className="flex items-center gap-2 text-sm text-red-600">
+                    <AlertCircle className="h-4 w-4" />
+                    {error}
+                  </div>
+                )}
+              </div>
+              <DialogFooter>
+                <Button variant="outline" onClick={() => setIsAddDialogOpen(false)}>
+                  Cancel
+                </Button>
+                <Button onClick={handleAddServer} disabled={loading}>
+                  {loading ? "Connecting..." : "Connect"}
+                </Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
+        </div>
       </div>
 
       {error && servers.length === 0 && (
@@ -310,4 +340,3 @@ export default function MCPServersManager() {
     </div>
   );
 }
-

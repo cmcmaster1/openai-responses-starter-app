@@ -1,0 +1,27 @@
+[Unit]
+Description=responses.js server - Harmony Responses API proxy for vLLM
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/mnt/hdd/projects/openai-responses-starter-app
+ExecStart=/mnt/hdd/projects/openai-responses-starter-app/start-responses-js-service.sh
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=responses-js
+
+# Environment variables (can be overridden by .env.local)
+Environment="NODE_ENV=production"
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+
+# Resource limits (adjust as needed)
+LimitNOFILE=65536
+
+[Install]
+WantedBy=default.target

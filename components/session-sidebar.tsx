@@ -165,10 +165,25 @@ export default function SessionSidebar() {
 
   // Track if we've initialized to avoid re-running
   const initializedRef = React.useRef(false);
+  const [sessionsHydrated, setSessionsHydrated] = React.useState(
+    () => useSessionsStore.persist?.hasHydrated?.() ?? false
+  );
 
   React.useEffect(() => {
-    // Only run initialization once, or when sessions change from empty to non-empty
-    if (initializedRef.current && sessions.length > 0) return;
+    const unsubscribeFinish = useSessionsStore.persist?.onFinishHydration?.(() => {
+      setSessionsHydrated(true);
+    });
+    const unsubscribeHydrate = useSessionsStore.persist?.onHydrate?.(() => {
+      setSessionsHydrated(false);
+    });
+    return () => {
+      unsubscribeFinish?.();
+      unsubscribeHydrate?.();
+    };
+  }, []);
+
+  React.useEffect(() => {
+    if (!sessionsHydrated || initializedRef.current) return;
 
     if (sessions.length === 0) {
       initializedRef.current = true;
@@ -176,14 +191,13 @@ export default function SessionSidebar() {
       loadSessionIntoConversation(session, loadConversation);
       return;
     }
-    if (!currentSessionId && sessions.length > 0) {
-      initializedRef.current = true;
-      const session = sessions[0];
-      selectSession(session.id);
-      loadSessionIntoConversation(session, loadConversation);
-    }
+    const sessionToLoad =
+      sessions.find((session) => session.id === currentSessionId) ?? sessions[0];
+    selectSession(sessionToLoad.id);
+    loadSessionIntoConversation(sessionToLoad, loadConversation);
+    initializedRef.current = true;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessions.length, currentSessionId]); // Reduced dependencies - functions are stable
+  }, [sessionsHydrated, sessions, currentSessionId]);
 
   const handleNewSession = React.useCallback(() => {
     const session = createSession();

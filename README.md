@@ -55,6 +55,8 @@ This app is meant to be used as a starting point to build a conversational assis
    ```
 
    The app will be available at [`http://localhost:3000`](http://localhost:3000).
+   
+   **Network access:** The dev server is configured to bind to all network interfaces (`0.0.0.0`), so you can also access it from other devices on your network using your machine's IP address or Tailscale hostname (e.g., `http://your-tailscale-hostname:3000`).
 
 ## Tools
 

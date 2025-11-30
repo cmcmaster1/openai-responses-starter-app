@@ -2,7 +2,7 @@
 import React from "react";
 import Chat from "./chat";
 import useConversationStore from "@/stores/useConversationStore";
-import { Item, processMessages } from "@/lib/assistant";
+import { Item, UploadedContextFile, processMessages } from "@/lib/assistant";
 import useSessionsStore from "@/stores/useSessionsStore";
 
 export default function Assistant() {
@@ -58,24 +58,72 @@ export default function Assistant() {
     });
   }, [chatMessages, conversationItems, currentSessionId, updateSession]);
 
-  const handleSendMessage = async (message: string, enabledMcpServers?: string[] | null) => {
-    if (!message.trim()) return;
+  const formatBytes = (bytes: number) => {
+    if (!bytes || Number.isNaN(bytes)) return "";
+    const units = ["B", "KB", "MB", "GB"];
+    const i = Math.min(
+      units.length - 1,
+      Math.floor(Math.log(bytes) / Math.log(1024))
+    );
+    const value = bytes / 1024 ** i;
+    return `${value.toFixed(value >= 10 ? 0 : 1)}${units[i]}`;
+  };
+
+  const handleSendMessage = async (
+    message: string,
+    enabledMcpServers?: string[] | null,
+    attachments?: UploadedContextFile[]
+  ) => {
+    const trimmed = message.trim();
+    const safeAttachments = attachments ?? [];
+    if (!trimmed && safeAttachments.length === 0) return;
 
     const userItem: Item = {
       type: "message",
       role: "user",
-      content: [{ type: "input_text", text: message.trim() }],
+      content: [
+        ...(trimmed
+          ? [
+              {
+                type: "input_text" as const,
+                text: trimmed,
+              },
+            ]
+          : []),
+        ...safeAttachments.map((file) => {
+          const header = [
+            `Attachment: ${file.name}`,
+            file.mimeType ? `(${file.mimeType})` : null,
+            formatBytes(file.size),
+            file.truncated ? "truncated for length" : null,
+          ]
+            .filter(Boolean)
+            .join(" ");
+
+          return {
+            type: "input_text" as const,
+            text: `${header}\n\n${file.text}`,
+            metadata: {
+              kind: "attachment",
+              filename: file.name,
+              mime_type: file.mimeType,
+              size: file.size,
+              truncated: file.truncated,
+            },
+          };
+        }),
+      ],
     };
     const userMessage: any = {
       role: "user",
-      content: message.trim(),
+      content: userItem.content,
     };
 
     const existingUserMessages = chatMessages.filter(
       (item) => item.type === "message" && item.role === "user"
     );
-    if (existingUserMessages.length === 0) {
-      generateSessionTitle(message);
+    if (existingUserMessages.length === 0 && trimmed) {
+      generateSessionTitle(trimmed);
     }
 
     try {

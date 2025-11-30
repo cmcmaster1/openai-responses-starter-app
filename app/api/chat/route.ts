@@ -389,6 +389,42 @@ const extractDeltaText = (delta: any) => {
   return "";
 };
 
+const STEP_STREAM_CHUNK_SIZE = Number(process.env.STEP_STREAM_CHUNK_SIZE || "80");
+const STEP_STREAM_CHUNK_DELAY_MS = Number(process.env.STEP_STREAM_CHUNK_DELAY_MS || "8");
+
+const streamAssistantText = async (
+  controller: ReadableStreamDefaultController,
+  text: string
+) => {
+  if (!text) return;
+  const chunkSize = STEP_STREAM_CHUNK_SIZE > 0 ? STEP_STREAM_CHUNK_SIZE : 80;
+  const delayMs = STEP_STREAM_CHUNK_DELAY_MS >= 0 ? STEP_STREAM_CHUNK_DELAY_MS : 8;
+
+  for (let i = 0; i < text.length; i += chunkSize) {
+    const delta = text.slice(i, i + chunkSize);
+    send(controller, "message", { role: "assistant", delta });
+    if (delayMs > 0 && i + chunkSize < text.length) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+};
+
+const extractOutputText = (content: any): string => {
+  if (!content) return "";
+  const parts = Array.isArray(content) ? content : [content];
+  return parts
+    .map((part) => {
+      if (!part) return "";
+      if (typeof part === "string") return part;
+      if (typeof part.text === "string") return part.text;
+      if (typeof part.content === "string") return part.content;
+      if (typeof part.delta === "string") return part.delta;
+      return "";
+    })
+    .filter(Boolean)
+    .join("");
+};
+
 export const runtime = "nodejs";
 const describeTool = (tool: any) =>
   tool?.name || tool?.function?.name || tool?.type || "unknown";
@@ -458,6 +494,12 @@ export async function POST(req: NextRequest) {
     const prepareTools = async (
       controller: ReadableStreamDefaultController
     ) => {
+      // If no servers are enabled, return empty tools immediately (opt-in system)
+      if (!enabledServersSet || enabledServersSet.size === 0) {
+        debugLog(`[MCP] No servers enabled, returning empty tools list`);
+        return { allTools: [], toolNameMap: new Map(), responsesTools: null };
+      }
+
       const allMcpTools = await listToolsWithWait(enabledServersSet, (info) => {
         if (!info.missing.length) return;
         const message =
@@ -476,9 +518,8 @@ export async function POST(req: NextRequest) {
           item_id: itemId,
         });
       });
-      const mcpTools = enabledServersSet
-        ? allMcpTools.filter(({ server }) => enabledServersSet.has(server))
-        : allMcpTools;
+      // Only include tools from enabled servers (opt-in system)
+      const mcpTools = allMcpTools.filter(({ server }) => enabledServersSet.has(server));
 
       const toolNameMap = new Map<string, ToolRoutingInfo>();
       const allTools = mcpTools.map(({ server, tool }) => {
@@ -515,12 +556,15 @@ export async function POST(req: NextRequest) {
           })
         : null;
 
-      send(controller, "reasoning", {
-        content: `MCP servers ready: ${Array.from(
-          new Set(mcpTools.map((t) => t.server))
-        ).join(", ") || "none"}`,
-        item_id: `mcp_ready_${Date.now()}`,
-      });
+      // Only send ready message if we have enabled servers
+      if (mcpTools.length > 0) {
+        send(controller, "reasoning", {
+          content: `MCP servers ready: ${Array.from(
+            new Set(mcpTools.map((t) => t.server))
+          ).join(", ")}`,
+          item_id: `mcp_ready_${Date.now()}`,
+        });
+      }
 
       return { allTools, toolNameMap, responsesTools };
     };
@@ -535,8 +579,6 @@ export async function POST(req: NextRequest) {
     debugLog(
       `[MCP] Enabled servers requested: ${requiredServersLog(enabledServersSet)}`
     );
-
-    const allMcpTools = await listToolsWithWait(enabledServersSet);
 
     const baseSystemPrompt = getSystemPrompt();
     const systemPrompt = applyReasoningLevelToPrompt(
@@ -600,151 +642,498 @@ export async function POST(req: NextRequest) {
                 break;
               }
 
-            const toolsParam = useResponsesAPI
-              ? responsesTools && responsesTools.length
-                ? responsesTools
-                : undefined
-              : allTools.length
-                ? allTools
-                : undefined;
-            const toolChoiceParam =
-              toolsParam && tool_choice ? tool_choice : toolsParam ? "auto" : undefined;
-
-            if (useResponsesAPI) {
-              // Use Responses API (Harmony-compliant)
-              debugLog(
-                `[#${turn + 1}] Calling responses.create with ${ctx.length} items (Harmony format)`
-              );
-              
-              const responsesInput = harmonyToResponsesInput(ctx);
-              if (!responsesInput.length) {
-                warnLog("No valid input for Responses API, stopping agent loop");
-                break;
-              }
-              if (verboseLogs) {
-                try {
-                  console.log(
-                    `[#${turn + 1}] Responses input:`,
-                    JSON.stringify(responsesInput, null, 2)
-                  );
-                } catch {
-                  console.log(`[#${turn + 1}] Responses input:`, responsesInput);
-                }
-              }
-
-              if (toolsParam?.length) {
+              const toolsParam = useResponsesAPI
+                ? responsesTools && responsesTools.length
+                  ? responsesTools
+                  : undefined
+                : allTools.length
+                  ? allTools
+                  : undefined;
+              const toolChoiceParam =
+                toolsParam && tool_choice ? tool_choice : toolsParam ? "auto" : undefined;
+  
+              if (useResponsesAPI) {
+                // Use Responses API (Harmony-compliant, non-stream) and synthesize SSE events
                 debugLog(
-                  `[#${turn + 1}] Tools available (${toolsParam.length}):`,
-                  toolsParam.map((tool) => describeTool(tool)).join(", ")
+                  `[#${turn + 1}] Calling responses.create with ${ctx.length} items (Harmony format)`
                 );
-              }
-
-              try {
-                // Use non-streaming Responses API (step-streaming approach)
-                // responses.js will handle the translation to Chat Completions
-                // Note: tools format may need adjustment for Responses API
-                const responseParams: any = {
-                  model: MODEL,
-                  input: responsesInput,
-                  max_output_tokens: 128000,
-                  stream: false,
-                  temperature: 1.0,
-                };
-                
-                // Add tools if available (Responses API format)
-                if (toolsParam && toolsParam.length > 0) {
-                  responseParams.tools = toolsParam;
+  
+                const responsesInput = harmonyToResponsesInput(ctx);
+                if (!responsesInput.length) {
+                  warnLog("No valid input for Responses API, stopping agent loop");
+                  break;
                 }
-                
-                // Add tool_choice if specified
-                if (toolChoiceParam) {
-                  responseParams.tool_choice = toolChoiceParam;
-                }
-                
-                const response = await client.responses.create(responseParams);
-
-                // Process Responses API output format
-                const outputItems = response.output ?? [];
                 if (verboseLogs) {
                   try {
                     console.log(
-                      `[#${turn + 1}] Responses output raw:`,
-                      JSON.stringify(outputItems, null, 2)
+                      `[#${turn + 1}] Responses input:`,
+                      JSON.stringify(responsesInput, null, 2)
                     );
                   } catch {
-                    console.log(`[#${turn + 1}] Responses output raw:`, outputItems);
+                    console.log(`[#${turn + 1}] Responses input:`, responsesInput);
                   }
                 }
+  
+                if (toolsParam?.length) {
+                  debugLog(
+                    `[#${turn + 1}] Tools available (${toolsParam.length}):`,
+                    toolsParam.map((tool) => describeTool(tool)).join(", ")
+                  );
+                }
+  
+                try {
+                  const isNativeStream = process.env.AGENTS_TEXT_STREAMING_MODE === "native";
+                  const responseParams: any = {
+                    model: MODEL,
+                    input: responsesInput,
+                    max_output_tokens: 128000,
+                    stream: isNativeStream,
+                    temperature: 1.0,
+                    ...(reasoning_level ? { reasoning: { effort: reasoning_level } } : {}),
+                  };
+  
+                  if (toolsParam && toolsParam.length > 0) {
+                    responseParams.tools = toolsParam;
+                  }
+                  if (toolChoiceParam) {
+                    responseParams.tool_choice = toolChoiceParam;
+                  }
+
+                  let assistantText = "";
+                  let reasoningBuffer = "";
+                  const toolCalls: any[] = [];
+
+                  if (isNativeStream) {
+                    debugLog(`[#${turn + 1}] Starting native stream`);
+                    const stream = await client.responses.create(responseParams);
+                    const toolCallMap = new Map<string, { type: "function_call" | "mcp_call"; id: string; name: string; arguments: string; call_id?: string }>();
+                    
+                    for await (const event of stream as unknown as AsyncIterable<any>) {
+                      if (!event) continue;
+                      const type = event.type;
+
+                      if (type === "response.output_text.delta") {
+                         const delta = event.delta;
+                         if (delta) {
+                           assistantText += delta;
+                           send(controller, "message", { role: "assistant", delta });
+                         }
+                      } else if (type === "response.reasoning_text.delta") {
+                         const delta = event.delta;
+                         if (delta) {
+                           reasoningBuffer += delta;
+                           // In native mode, we send accumulated reasoning (or could send delta if client supports it, but legacy sends content)
+                           send(controller, "reasoning", { 
+                             content: reasoningBuffer, 
+                             item_id: `reasoning_${turn + 1}_native` 
+                           });
+                         }
+                      } else if (type === "response.output_item.added") {
+                         const item = event.item;
+                         if (item.type === "function_call" || item.type === "mcp_call") {
+                            toolCallMap.set(item.id, { 
+                              type: item.type, 
+                              id: item.id, 
+                              name: item.name, 
+                              arguments: "", 
+                              call_id: item.call_id || item.id 
+                            });
+                         }
+                      } else if (type === "response.function_call_arguments.delta" || type === "response.mcp_call.arguments_delta" || type === "response.mcp_call_arguments.delta") {
+                         const itemId = event.item_id;
+                         const delta = event.delta;
+                         if (itemId && delta && toolCallMap.has(itemId)) {
+                            const call = toolCallMap.get(itemId)!;
+                            call.arguments += delta;
+                         }
+                      } else if (type === "response.output_item.done") {
+                         const item = event.item;
+                         if ((item.type === "function_call" || item.type === "mcp_call") && toolCallMap.has(item.id)) {
+                            // Ensure we have the full item state
+                            const call = toolCallMap.get(item.id)!;
+                            if (item.arguments) call.arguments = item.arguments; // overwrite with final if available
+                            
+                            // For native responses.js stream, tool calls are collected here
+                            // We push them to toolCalls to be executed after the stream loop
+                            // Note: responses.js might execute MCP tools internally if configured, 
+                            // but if we are here, we might need to handle them if they weren't auto-executed.
+                            // However, responses.js events like 'response.mcp_call.completed' indicate it was executed.
+                            // If we see 'response.function_call', it's likely a local tool or one responses.js didn't handle.
+                            
+                            // If item.type is function_call, we definitely handle it.
+                            // If item.type is mcp_call, responses.js might have handled it?
+                            // Let's check if responses.js emits 'response.mcp_call.completed' or 'failed'.
+                            // If so, we shouldn't re-execute it.
+                         }
+                      } else if (type === "response.mcp_call.completed" || type === "response.mcp_call.failed") {
+                          // responses.js executed this tool. We should probably NOT execute it again.
+                          // But we need to let the client know about the result?
+                          // The 'item' in this event doesn't contain the result.
+                          // We probably need to wait for 'response.output_item.done' which might contain output?
+                          // Checking responses.js source: 
+                          // outputObject.output = toolResult.output; 
+                          // yield { type: "response.output_item.done", item: lastOutputItem ... }
+                          // So .done event item will have the output.
+                      }
+                    }
+                    
+                    // Populate toolCalls from the map
+                    for (const call of toolCallMap.values()) {
+                         // If it's a function_call, we need to execute it.
+                         // If it's an mcp_call, check if we have the output in the item?
+                         // Wait, the loop above doesn't capture the FINAL item with output.
+                         // Let's just collect all function_calls for now.
+                         if (call.type === "function_call") {
+                            toolCalls.push({
+                               type: "function_call",
+                               id: call.id,
+                               call_id: call.call_id,
+                               name: call.name,
+                               arguments: call.arguments, // Use arguments string directly
+                               arguments_json: call.arguments // For consistency with other code that might check this
+                            });
+                         }
+                    }
+
+                  } else {
+                    const response = await client.responses.create(responseParams);
+                    const responseOutput = Array.isArray(response.output)
+                        ? response.output
+                        : [];
+    
+                    for (const item of responseOutput) {
+                        if (!item) continue;
+                        const itemType = item.type;
+                        if (itemType === "message") {
+                        const text = extractOutputText(item.content);
+                        if (text) {
+                            assistantText = assistantText
+                            ? `${assistantText}\n\n${text}`
+                            : text;
+                        }
+                        } else if (itemType === "reasoning") {
+                        const reasoningText = extractOutputText(item.content);
+                        if (reasoningText) {
+                            reasoningBuffer = reasoningBuffer
+                            ? `${reasoningBuffer}${reasoningText}`
+                            : reasoningText;
+                        }
+                        } else if (itemType === "function_call" || itemType === "tool_call") {
+                        toolCalls.push(item);
+                        }
+                    }
+                  }
+
+                  if (!isNativeStream && reasoningBuffer) {
+                    send(controller, "reasoning", {
+                      content: reasoningBuffer,
+                      item_id: `reasoning_${turn + 1}_${Date.now()}`,
+                    });
+                  }
+  
+                  if (!isNativeStream && assistantText) {
+                    await streamAssistantText(controller, assistantText);
+                    ctx.push({
+                      role: "assistant",
+                      type: "message",
+                      content: [{ type: "input_text", text: assistantText }],
+                    });
+                  }
+  
+                  if (!toolCalls.length) {
+                    if (assistantText) {
+                      debugLog(
+                        `[#${turn + 1}] Assistant responded with text and no tool calls, stopping agent loop`
+                      );
+                      break;
+                    }
+                    if (reasoningBuffer && !assistantText) {
+                      debugLog(
+                        `[#${turn + 1}] Only reasoning returned, continuing to next turn`
+                      );
+                      continue;
+                    }
+                    debugLog(
+                      `[#${turn + 1}] No tool calls or assistant text returned, stopping agent loop`
+                    );
+                    break;
+                  }
+  
+                  for (const toolCall of toolCalls) {
+                    if (!toolCall?.name) {
+                      warnLog(`[#${turn + 1}] Skipping tool call without name: ${toolCall?.id}`);
+                      continue;
+                    }
+  
+                    let args: any = {};
+                    try {
+                      args = JSON.parse(
+                        toolCall.arguments_json ||
+                          toolCall.arguments ||
+                          "{}"
+                      );
+                    } catch {
+                      warnLog(
+                        `[#${turn + 1}] Failed to parse tool call arguments:`,
+                        toolCall.arguments
+                      );
+                    }
+  
+                    const routingInfo =
+                      toolNameMap.get(toolCall.name) ||
+                      toolNameMap.get(sanitize(toolCall.name));
+                    if (!routingInfo) {
+                      warnLog(`[#${turn + 1}] Unknown tool requested: ${toolCall.name}`);
+                      continue;
+                    }
+  
+                    const toolName = routingInfo.displayName;
+                    const callId =
+                      toolCall.call_id ||
+                      toolCall.id ||
+                      `call_${Math.random().toString(36).slice(2)}`;
+  
+                    debugLog(
+                      `[#${turn + 1}] Executing tool ${toolName} (${callId}) with args`,
+                      args
+                    );
+                    send(controller, "tool_call", { name: toolName, args, call_id: callId });
+  
+                    const callArgumentsJson = JSON.stringify(args ?? {});
+                    ctx.push({
+                      type: "function_call" as const,
+                      id: callId,
+                      call_id: callId,
+                      name: toolName,
+                      arguments: callArgumentsJson,
+                      status: null,
+                    });
+  
+                    let result: any;
+                    try {
+                      result = await callTool(toolName, args, routingInfo);
+                      debugLog(
+                        `[#${turn + 1}] Tool ${toolName} result:`,
+                        JSON.stringify(result).substring(0, 200)
+                      );
+                    } catch (e: any) {
+                      console.error(`[#${turn + 1}] Tool ${toolName} error: ${e?.message || e}`);
+                      debugLog(`[#${turn + 1}] Tool ${toolName} error details:`, e);
+                      result = { error: String(e?.message || e) };
+                    }
+  
+                    send(controller, "tool_result", { name: toolName, result, call_id: callId });
+  
+                    let resultContent: string;
+                    try {
+                      if (typeof result === "string") {
+                        resultContent = result;
+                      } else {
+                        resultContent = JSON.stringify(result);
+                      }
+                    } catch {
+                      resultContent = String(result ?? "Tool execution failed");
+                    }
+  
+                    const MAX_TOOL_RESULT_LENGTH = 8000;
+                    if (resultContent.length > MAX_TOOL_RESULT_LENGTH) {
+                      const originalLength = resultContent.length;
+                      const truncated = resultContent.slice(0, MAX_TOOL_RESULT_LENGTH);
+                      const truncationNote = `\n\n[Result truncated from ${originalLength} to ${MAX_TOOL_RESULT_LENGTH} characters]`;
+                      resultContent = truncated + truncationNote;
+                      warnLog(
+                        `[#${turn + 1}] Tool ${toolName} result truncated from ${originalLength} to ${MAX_TOOL_RESULT_LENGTH} chars`
+                      );
+                    }
+  
+                    ctx.push({
+                      type: "function_call_output" as const,
+                      call_id: callId,
+                      name: toolName,
+                      output: resultContent,
+                    });
+                  }
+                } catch (apiError: any) {
+                  const summary = `[#${turn + 1}] Responses API Error: status=${apiError?.status ?? "unknown"} message=${apiError?.message ?? apiError}`;
+                  console.error(summary);
+                  errorLog("Full API error payload:", {
+                    status: apiError?.status,
+                    message: apiError?.message,
+                    error: apiError?.error,
+                    code: apiError?.code,
+                  });
+                  throw apiError;
+                }
+              } else {
+                // Fallback to Chat Completions API (legacy)
+                const chatMessages = harmonyToChatMessages(ctx);
+                if (!chatMessages.length) {
+                  warnLog("No conversation context available, stopping agent loop");
+                  break;
+                }
+  
+                debugLog(
+                  `[#${turn + 1}] Calling chat.completions with ${chatMessages.length} messages (legacy mode)`
+                );
+                if (toolsParam?.length) {
+                  debugLog(
+                    `[#${turn + 1}] Tools available (${toolsParam.length}):`,
+                    toolsParam.map((tool) => describeTool(tool)).join(", ")
+                  );
+                } else {
+                  debugLog(`[#${turn + 1}] No tools available this turn`);
+                }
+  
                 let assistantText = "";
-                const toolCalls: any[] = [];
-
-                for (const item of outputItems) {
-                  const itemType = item?.type;
-                  if (itemType === "message" || itemType === "output_text") {
-                    const msg: any = item;
-                    const textPieces: string[] = [];
-                    if (typeof msg.output_text === "string") textPieces.push(msg.output_text);
-                    if (typeof msg.text === "string") textPieces.push(msg.text);
-                    if (Array.isArray(msg.content)) {
-                      for (const c of msg.content) {
-                        if (typeof c?.text === "string") textPieces.push(c.text);
-                        else if (typeof c?.output_text === "string") textPieces.push(c.output_text);
-                      }
+                const toolCallMap = new Map<
+                  string,
+                  { id: string; index?: number; name: string; arguments: string }
+                >();
+                let reasoningBuffer = "";
+                let reasoningId: string | null = null;
+                let finishReason: string | null = null;
+  
+                try {
+                  const completionParams: any = {
+                    model: MODEL,
+                    messages: chatMessages,
+                    ...(toolsParam ? { tools: toolsParam } : {}),
+                    ...(toolChoiceParam ? { tool_choice: toolChoiceParam } : {}),
+                    max_tokens: 128000,
+                    stream: true,
+                    temperature: 1.0,
+                    top_p: 1.0,
+                    top_k: 100,
+                    ...(reasoning_level ? { reasoning_effort: reasoning_level } : {}),
+                  };
+                  const completion = await client.chat.completions.create(completionParams);
+  
+                  for await (const part of completion as unknown as AsyncIterable<any>) {
+                    const choice = part.choices?.[0];
+                    if (!choice) continue;
+                    
+                    if (choice.finish_reason) {
+                      finishReason = choice.finish_reason;
+                      debugLog(`[#${turn + 1}] Stream finished with reason: ${finishReason}`);
                     }
-                    const text = textPieces.join("");
-
-                    if (text) {
-                      assistantText += text;
-                      const chunkSize = 80;
-                      for (let i = 0; i < text.length; i += chunkSize) {
-                        await new Promise((r) => setTimeout(r, 8));
-                        send(controller, "message", {
-                          role: "assistant",
-                          delta: text.slice(i, i + chunkSize),
-                        });
-                      }
-                    }
-
-                    const reasoningSource =
-                      msg.reasoning_content ||
-                      msg.reasoning ||
-                      (Array.isArray(msg.content)
-                        ? msg.content.find((c: any) => c?.type === "reasoning")
-                        : null);
-                    const reasoningText =
-                      typeof reasoningSource === "string"
-                        ? reasoningSource
-                        : Array.isArray(reasoningSource)
-                          ? reasoningSource.map((c: any) => c?.text || "").join("")
-                          : typeof reasoningSource?.text === "string"
-                            ? reasoningSource.text
-                            : "";
-                    if (reasoningText) {
-                      const reasoningId = `reasoning_${turn + 1}_${Math.random().toString(36).slice(2, 8)}`;
+                    
+                    const delta = choice.delta ?? {};
+  
+                    const reasoningDelta = extractReasoningText(delta);
+                    if (reasoningDelta) {
+                      reasoningId =
+                        reasoningId ||
+                        `reasoning_${turn + 1}_${Math.random().toString(36).slice(2, 8)}`;
+                      reasoningBuffer += reasoningDelta;
                       send(controller, "reasoning", {
-                        content: reasoningText,
+                        content: reasoningBuffer,
                         item_id: reasoningId,
                       });
                     }
-                  } else if (itemType === "reasoning") {
-                    const reasoningText = Array.isArray((item as any).content)
-                      ? (item as any).content.map((c: any) => c?.text || "").join("")
-                      : typeof (item as any).text === "string"
-                        ? (item as any).text
-                        : "";
-                    if (reasoningText) {
-                      const reasoningId = `reasoning_${turn + 1}_${Math.random().toString(36).slice(2, 8)}`;
-                      send(controller, "reasoning", {
-                        content: reasoningText,
-                        item_id: reasoningId,
+  
+                    const textDelta = extractDeltaText(delta);
+                    if (textDelta) {
+                      assistantText += textDelta;
+                      send(controller, "message", {
+                        role: "assistant",
+                        delta: textDelta,
                       });
                     }
-                  } else if (itemType === "function_call" || itemType === "tool_call") {
-                    toolCalls.push(item);
+  
+                    if (Array.isArray(delta.tool_calls)) {
+                      for (const toolDelta of delta.tool_calls) {
+                        const deltaIndex =
+                          typeof toolDelta.index === "number" ? toolDelta.index : undefined;
+                        const deltaId = toolDelta.id || undefined;
+  
+                        let existingKey: string | undefined;
+                        let existing: { id: string; index?: number; name: string; arguments: string } | undefined;
+  
+                        if (deltaId && toolCallMap.has(deltaId)) {
+                          existingKey = deltaId;
+                          existing = toolCallMap.get(deltaId);
+                        } else if (
+                          deltaIndex !== undefined &&
+                          toolCallMap.has(`index_${deltaIndex}`)
+                        ) {
+                          existingKey = `index_${deltaIndex}`;
+                          existing = toolCallMap.get(existingKey);
+                        } else {
+                          for (const [key, entry] of toolCallMap.entries()) {
+                            if (
+                              (deltaId && entry.id === deltaId) ||
+                              (deltaIndex !== undefined && entry.index === deltaIndex)
+                            ) {
+                              existingKey = key;
+                              existing = entry;
+                              break;
+                            }
+                          }
+                        }
+  
+                        if (!existing) {
+                          const newId = deltaId || `tool_${toolCallMap.size}`;
+                          const newKey = deltaId || (deltaIndex !== undefined ? `index_${deltaIndex}` : newId);
+                          existing = {
+                            id: newId,
+                            index: deltaIndex,
+                            name: "",
+                            arguments: "",
+                          };
+                          existingKey = newKey;
+                          if (existingKey) {
+                            toolCallMap.set(existingKey, existing);
+                          }
+                        }
+  
+                        const updated = {
+                          id: deltaId || existing.id,
+                          index: deltaIndex !== undefined ? deltaIndex : existing.index,
+                          name: toolDelta.function?.name || existing.name,
+                          arguments:
+                            existing.arguments + (toolDelta.function?.arguments || ""),
+                        };
+  
+                        const preferredKey = updated.id || (updated.index !== undefined ? `index_${updated.index}` : existingKey);
+                        if (preferredKey && existingKey && preferredKey !== existingKey) {
+                          toolCallMap.delete(existingKey);
+                          toolCallMap.set(preferredKey, updated);
+                        } else if (existingKey) {
+                          toolCallMap.set(existingKey, updated);
+                        } else if (preferredKey) {
+                          toolCallMap.set(preferredKey, updated);
+                        }
+                      }
+                    }
                   }
+                } catch (apiError: any) {
+                  const summary = `[#${turn + 1}] API Error: status=${apiError?.status ?? "unknown"} message=${apiError?.message ?? apiError}`;
+                  console.error(summary);
+                  errorLog("Full API error payload:", {
+                    status: apiError?.status,
+                    message: apiError?.message,
+                    error: apiError?.error,
+                    code: apiError?.code,
+                  });
+                  throw apiError;
                 }
-
-                // Add assistant message to context
+  
+                const toolCallSummary = Array.from(toolCallMap.values()).map((call) => ({
+                  id: call.id,
+                  name: call.name,
+                  argsPreview: (call.arguments || "").slice(0, 120),
+                }));
+                debugLog(
+                  `[#${turn + 1}] Stream completed. Finish reason: ${finishReason || "none"}. Assistant text length=${assistantText.length}. Tool calls reported=${toolCallSummary.length}`
+                );
+                if (toolCallSummary.length) {
+                  debugLog(`[#${turn + 1}] Tool call summary:`, toolCallSummary);
+                }
+  
+                if (reasoningBuffer && !assistantText) {
+                  debugLog(`[#${turn + 1}] Reasoning present without text, will continue to next turn`);
+                }
+  
                 if (assistantText) {
                   ctx.push({
                     role: "assistant",
@@ -752,39 +1141,48 @@ export async function POST(req: NextRequest) {
                     content: [{ type: "input_text", text: assistantText }],
                   });
                 }
-
-                // Process tool calls
-                if (!toolCalls.length) {
-                  debugLog(`[#${turn + 1}] No tool calls, stopping agent loop`);
+  
+                const completedToolCalls = Array.from(toolCallMap.values());
+                
+                if (finishReason === "stop" && !completedToolCalls.length) {
+                  debugLog(`[#${turn + 1}] Finish reason is "stop" with no tool calls, stopping agent loop`);
                   break;
                 }
-
-                for (const toolCall of toolCalls) {
-                  if (!toolCall.name) {
-                    warnLog(`[#${turn + 1}] Skipping tool call without name: ${toolCall.id}`);
+                
+                if (!completedToolCalls.length) {
+                  if (assistantText) {
+                    debugLog(`[#${turn + 1}] No tool calls and assistant text present, stopping agent loop`);
+                    break;
+                  }
+                  if (reasoningBuffer && !assistantText) {
+                    debugLog(`[#${turn + 1}] Only reasoning present, continuing to next turn`);
                     continue;
                   }
-
-                  let args: any = {};
-                  try {
-                    args = JSON.parse(toolCall.arguments_json || toolCall.arguments || "{}");
-                  } catch (e) {
-                    warnLog(`[#${turn + 1}] Failed to parse tool call arguments:`, toolCall.arguments);
+                  debugLog(`[#${turn + 1}] No tool calls, no text, no reasoning - stopping agent loop`);
+                  break;
+                }
+  
+                // Process tool calls (same as Responses API path above)
+                for (const call of completedToolCalls) {
+                  if (!call.name) {
+                    warnLog(`[#${turn + 1}] Skipping tool call without name: ${call.id}`);
+                    continue;
                   }
-
+                  const args = safeParseJSON(call.arguments, `tool ${call.name || call.id}`);
+  
                   const routingInfo =
-                    toolNameMap.get(toolCall.name) || toolNameMap.get(sanitize(toolCall.name));
+                    toolNameMap.get(call.name) || toolNameMap.get(sanitize(call.name));
                   if (!routingInfo) {
-                    warnLog(`[#${turn + 1}] Unknown tool requested: ${toolCall.name}`);
+                    warnLog(`[#${turn + 1}] Unknown tool requested: ${call.name}`);
                     continue;
                   }
-
+  
                   const toolName = routingInfo.displayName;
-                  const callId = toolCall.id || `call_${Math.random().toString(36).slice(2)}`;
-
+                  const callId = call.id || `call_${Math.random().toString(36).slice(2)}`;
+  
                   debugLog(`[#${turn + 1}] Executing tool ${toolName} (${callId}) with args`, args);
                   send(controller, "tool_call", { name: toolName, args, call_id: callId });
-
+  
                   const callArgumentsJson = JSON.stringify(args ?? {});
                   ctx.push({
                     type: "function_call" as const,
@@ -794,7 +1192,7 @@ export async function POST(req: NextRequest) {
                     arguments: callArgumentsJson,
                     status: null,
                   });
-
+  
                   let result: any;
                   try {
                     result = await callTool(toolName, args, routingInfo);
@@ -807,9 +1205,9 @@ export async function POST(req: NextRequest) {
                     debugLog(`[#${turn + 1}] Tool ${toolName} error details:`, e);
                     result = { error: String(e?.message || e) };
                   }
-
+  
                   send(controller, "tool_result", { name: toolName, result, call_id: callId });
-
+  
                   let resultContent: string;
                   try {
                     if (typeof result === "string") {
@@ -820,8 +1218,7 @@ export async function POST(req: NextRequest) {
                   } catch {
                     resultContent = String(result ?? "Tool execution failed");
                   }
-
-                  // Truncate very large tool results
+  
                   const MAX_TOOL_RESULT_LENGTH = 8000;
                   if (resultContent.length > MAX_TOOL_RESULT_LENGTH) {
                     const originalLength = resultContent.length;
@@ -832,7 +1229,7 @@ export async function POST(req: NextRequest) {
                       `[#${turn + 1}] Tool ${toolName} result truncated from ${originalLength} to ${MAX_TOOL_RESULT_LENGTH} chars`
                     );
                   }
-
+  
                   ctx.push({
                     type: "function_call_output" as const,
                     call_id: callId,
@@ -840,292 +1237,9 @@ export async function POST(req: NextRequest) {
                     output: resultContent,
                   });
                 }
-              } catch (apiError: any) {
-                const summary = `[#${turn + 1}] Responses API Error: status=${apiError?.status ?? "unknown"} message=${apiError?.message ?? apiError}`;
-                console.error(summary);
-                errorLog("Full API error payload:", {
-                  status: apiError?.status,
-                  message: apiError?.message,
-                  error: apiError?.error,
-                  code: apiError?.code,
-                });
-                throw apiError;
-              }
-            } else {
-              // Fallback to Chat Completions API (legacy)
-              const chatMessages = harmonyToChatMessages(ctx);
-              if (!chatMessages.length) {
-                warnLog("No conversation context available, stopping agent loop");
-                break;
-              }
-
-              debugLog(
-                `[#${turn + 1}] Calling chat.completions with ${chatMessages.length} messages (legacy mode)`
-              );
-              if (toolsParam?.length) {
-                debugLog(
-                  `[#${turn + 1}] Tools available (${toolsParam.length}):`,
-                  toolsParam.map((tool) => describeTool(tool)).join(", ")
-                );
-              } else {
-                debugLog(`[#${turn + 1}] No tools available this turn`);
-              }
-
-              let assistantText = "";
-              const toolCallMap = new Map<
-                string,
-                { id: string; index?: number; name: string; arguments: string }
-              >();
-              let reasoningBuffer = "";
-              let reasoningId: string | null = null;
-              let finishReason: string | null = null;
-
-              try {
-                const completionParams: any = {
-                  model: MODEL,
-                  messages: chatMessages,
-                  ...(toolsParam ? { tools: toolsParam } : {}),
-                  ...(toolChoiceParam ? { tool_choice: toolChoiceParam } : {}),
-                  max_tokens: 128000,
-                  stream: true,
-                  temperature: 1.0,
-                  top_p: 1.0,
-                  top_k: 100,
-                };
-                const completion = await client.chat.completions.create(completionParams);
-
-                for await (const part of completion as unknown as AsyncIterable<any>) {
-                  const choice = part.choices?.[0];
-                  if (!choice) continue;
-                  
-                  if (choice.finish_reason) {
-                    finishReason = choice.finish_reason;
-                    debugLog(`[#${turn + 1}] Stream finished with reason: ${finishReason}`);
-                  }
-                  
-                  const delta = choice.delta ?? {};
-
-                  const reasoningDelta = extractReasoningText(delta);
-                  if (reasoningDelta) {
-                    reasoningId =
-                      reasoningId ||
-                      `reasoning_${turn + 1}_${Math.random().toString(36).slice(2, 8)}`;
-                    reasoningBuffer += reasoningDelta;
-                    send(controller, "reasoning", {
-                      content: reasoningBuffer,
-                      item_id: reasoningId,
-                    });
-                  }
-
-                  const textDelta = extractDeltaText(delta);
-                  if (textDelta) {
-                    assistantText += textDelta;
-                    send(controller, "message", {
-                      role: "assistant",
-                      delta: textDelta,
-                    });
-                  }
-
-                  if (Array.isArray(delta.tool_calls)) {
-                    for (const toolDelta of delta.tool_calls) {
-                      const deltaIndex =
-                        typeof toolDelta.index === "number" ? toolDelta.index : undefined;
-                      const deltaId = toolDelta.id || undefined;
-
-                      let existingKey: string | undefined;
-                      let existing: { id: string; index?: number; name: string; arguments: string } | undefined;
-
-                      if (deltaId && toolCallMap.has(deltaId)) {
-                        existingKey = deltaId;
-                        existing = toolCallMap.get(deltaId);
-                      } else if (
-                        deltaIndex !== undefined &&
-                        toolCallMap.has(`index_${deltaIndex}`)
-                      ) {
-                        existingKey = `index_${deltaIndex}`;
-                        existing = toolCallMap.get(existingKey);
-                      } else {
-                        for (const [key, entry] of toolCallMap.entries()) {
-                          if (
-                            (deltaId && entry.id === deltaId) ||
-                            (deltaIndex !== undefined && entry.index === deltaIndex)
-                          ) {
-                            existingKey = key;
-                            existing = entry;
-                            break;
-                          }
-                        }
-                      }
-
-                      if (!existing) {
-                        const newId = deltaId || `tool_${toolCallMap.size}`;
-                        const newKey = deltaId || (deltaIndex !== undefined ? `index_${deltaIndex}` : newId);
-                        existing = {
-                          id: newId,
-                          index: deltaIndex,
-                          name: "",
-                          arguments: "",
-                        };
-                        existingKey = newKey;
-                        if (existingKey) {
-                          toolCallMap.set(existingKey, existing);
-                        }
-                      }
-
-                      const updated = {
-                        id: deltaId || existing.id,
-                        index: deltaIndex !== undefined ? deltaIndex : existing.index,
-                        name: toolDelta.function?.name || existing.name,
-                        arguments:
-                          existing.arguments + (toolDelta.function?.arguments || ""),
-                      };
-
-                      const preferredKey = updated.id || (updated.index !== undefined ? `index_${updated.index}` : existingKey);
-                      if (preferredKey && existingKey && preferredKey !== existingKey) {
-                        toolCallMap.delete(existingKey);
-                        toolCallMap.set(preferredKey, updated);
-                      } else if (existingKey) {
-                        toolCallMap.set(existingKey, updated);
-                      } else if (preferredKey) {
-                        toolCallMap.set(preferredKey, updated);
-                      }
-                    }
-                  }
-                }
-              } catch (apiError: any) {
-                const summary = `[#${turn + 1}] API Error: status=${apiError?.status ?? "unknown"} message=${apiError?.message ?? apiError}`;
-                console.error(summary);
-                errorLog("Full API error payload:", {
-                  status: apiError?.status,
-                  message: apiError?.message,
-                  error: apiError?.error,
-                  code: apiError?.code,
-                });
-                throw apiError;
-              }
-
-              const toolCallSummary = Array.from(toolCallMap.values()).map((call) => ({
-                id: call.id,
-                name: call.name,
-                argsPreview: (call.arguments || "").slice(0, 120),
-              }));
-              debugLog(
-                `[#${turn + 1}] Stream completed. Finish reason: ${finishReason || "none"}. Assistant text length=${assistantText.length}. Tool calls reported=${toolCallSummary.length}`
-              );
-              if (toolCallSummary.length) {
-                debugLog(`[#${turn + 1}] Tool call summary:`, toolCallSummary);
-              }
-
-              if (reasoningBuffer && !assistantText) {
-                debugLog(`[#${turn + 1}] Reasoning present without text, will continue to next turn`);
-              }
-
-              if (assistantText) {
-                ctx.push({
-                  role: "assistant",
-                  type: "message",
-                  content: [{ type: "input_text", text: assistantText }],
-                });
-              }
-
-              const completedToolCalls = Array.from(toolCallMap.values());
-              
-              if (finishReason === "stop" && !completedToolCalls.length) {
-                debugLog(`[#${turn + 1}] Finish reason is "stop" with no tool calls, stopping agent loop`);
-                break;
-              }
-              
-              if (!completedToolCalls.length) {
-                if (assistantText) {
-                  debugLog(`[#${turn + 1}] No tool calls and assistant text present, stopping agent loop`);
-                  break;
-                }
-                if (reasoningBuffer && !assistantText) {
-                  debugLog(`[#${turn + 1}] Only reasoning present, continuing to next turn`);
-                  continue;
-                }
-                debugLog(`[#${turn + 1}] No tool calls, no text, no reasoning - stopping agent loop`);
-                break;
-              }
-
-              // Process tool calls (same as Responses API path above)
-              for (const call of completedToolCalls) {
-                if (!call.name) {
-                  warnLog(`[#${turn + 1}] Skipping tool call without name: ${call.id}`);
-                  continue;
-                }
-                const args = safeParseJSON(call.arguments, `tool ${call.name || call.id}`);
-
-                const routingInfo =
-                  toolNameMap.get(call.name) || toolNameMap.get(sanitize(call.name));
-                if (!routingInfo) {
-                  warnLog(`[#${turn + 1}] Unknown tool requested: ${call.name}`);
-                  continue;
-                }
-
-                const toolName = routingInfo.displayName;
-                const callId = call.id || `call_${Math.random().toString(36).slice(2)}`;
-
-                debugLog(`[#${turn + 1}] Executing tool ${toolName} (${callId}) with args`, args);
-                send(controller, "tool_call", { name: toolName, args, call_id: callId });
-
-                const callArgumentsJson = JSON.stringify(args ?? {});
-                ctx.push({
-                  type: "function_call" as const,
-                  id: callId,
-                  call_id: callId,
-                  name: toolName,
-                  arguments: callArgumentsJson,
-                  status: null,
-                });
-
-                let result: any;
-                try {
-                  result = await callTool(toolName, args, routingInfo);
-                  debugLog(
-                    `[#${turn + 1}] Tool ${toolName} result:`,
-                    JSON.stringify(result).substring(0, 200)
-                  );
-                } catch (e: any) {
-                  console.error(`[#${turn + 1}] Tool ${toolName} error: ${e?.message || e}`);
-                  debugLog(`[#${turn + 1}] Tool ${toolName} error details:`, e);
-                  result = { error: String(e?.message || e) };
-                }
-
-                send(controller, "tool_result", { name: toolName, result, call_id: callId });
-
-                let resultContent: string;
-                try {
-                  if (typeof result === "string") {
-                    resultContent = result;
-                  } else {
-                    resultContent = JSON.stringify(result);
-                  }
-                } catch {
-                  resultContent = String(result ?? "Tool execution failed");
-                }
-
-                const MAX_TOOL_RESULT_LENGTH = 8000;
-                if (resultContent.length > MAX_TOOL_RESULT_LENGTH) {
-                  const originalLength = resultContent.length;
-                  const truncated = resultContent.slice(0, MAX_TOOL_RESULT_LENGTH);
-                  const truncationNote = `\n\n[Result truncated from ${originalLength} to ${MAX_TOOL_RESULT_LENGTH} characters]`;
-                  resultContent = truncated + truncationNote;
-                  warnLog(
-                    `[#${turn + 1}] Tool ${toolName} result truncated from ${originalLength} to ${MAX_TOOL_RESULT_LENGTH} chars`
-                  );
-                }
-
-                ctx.push({
-                  type: "function_call_output" as const,
-                  call_id: callId,
-                  name: toolName,
-                  output: resultContent,
-                });
               }
             }
-          }
-
+  
           send(controller, "done", {});
           controller.close();
         } catch (e: any) {

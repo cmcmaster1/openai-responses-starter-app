@@ -6,6 +6,13 @@ export interface ContentItem {
   type: "input_text" | "output_text" | "refusal" | "output_audio";
   annotations?: Annotation[];
   text?: string;
+  metadata?: {
+    kind?: "attachment" | "text";
+    filename?: string;
+    mime_type?: string;
+    size?: number;
+    truncated?: boolean;
+  };
 }
 
 // Message items for storing conversation history matching API shape
@@ -64,6 +71,15 @@ export type Item =
   | McpListToolsItem
   | McpApprovalRequestItem
   | ReasoningItem;
+
+export interface UploadedContextFile {
+  id: string;
+  name: string;
+  text: string;
+  mimeType: string;
+  size: number;
+  truncated?: boolean;
+}
 
 export const handleTurn = async (
   messages: any[],
